@@ -8,6 +8,9 @@ from collections import defaultdict
 import pytest
 import math
 
+# Import our main implementation
+from active_inference_ensemble import ActiveInferenceTokenEnsemble
+
 
 class MockGPT2Model:
     """Simplified GPT2 wrapper for testing"""
@@ -19,130 +22,6 @@ class MockGPT2Model:
         with torch.no_grad():
             outputs = self.model(input_ids)
             return outputs.logits
-
-
-class ActiveInferenceTokenEnsemble:
-    def __init__(self, models, vocab_size, sequence_length=512):
-        self.models = models
-        self.vocab_size = vocab_size
-        self.seq_len = sequence_length
-        
-        # PRIORS: Hierarchical prior beliefs about token sequences
-        self.transition_priors = torch.ones(vocab_size, vocab_size) / vocab_size
-        self.positional_priors = torch.ones(sequence_length, vocab_size) / vocab_size
-        self.model_priors = torch.ones(len(models)) / len(models)
-        
-        # BELIEFS: Current posterior beliefs
-        self.token_beliefs = torch.ones(vocab_size) / vocab_size
-        self.model_beliefs = torch.ones(len(models)) / len(models)
-        
-        # Precision parameters
-        self.precision_obs = 1.0
-        self.precision_trans = 1.0
-        
-    def compute_free_energy(self, observations, beliefs, priors, likelihood):
-        """Free Energy F = E_q[log q(s)] - E_q[log p(o,s)]"""
-        # Complexity cost: KL divergence between beliefs and priors
-        complexity = torch.sum(beliefs * (torch.log(beliefs + 1e-8) - torch.log(priors + 1e-8)))
-        
-        # Accuracy: Expected log likelihood under beliefs
-        accuracy = -torch.sum(beliefs * torch.log(likelihood + 1e-8))
-        
-        free_energy = complexity + accuracy
-        return free_energy, complexity, accuracy
-    
-    def get_current_prior(self, context_tokens=None, position=None):
-        """Hierarchical prior combining multiple sources"""
-        if context_tokens is None or len(context_tokens) == 0:
-            return self.positional_priors[0] if position is None else self.positional_priors[position]
-        
-        # Transition prior: P(s_t | s_{t-1})
-        last_token = context_tokens[-1].item()
-        if last_token >= self.vocab_size:
-            last_token = last_token % self.vocab_size
-        transition_prior = self.transition_priors[last_token]
-        
-        # Positional prior: P(s_t | position)
-        pos = len(context_tokens) if position is None else position
-        pos = min(pos, self.seq_len - 1)
-        positional_prior = self.positional_priors[pos]
-        
-        # Combine priors
-        combined_prior = (transition_prior * positional_prior)
-        combined_prior = combined_prior / torch.sum(combined_prior)
-        
-        return combined_prior
-    
-    def compute_observation_likelihood(self, observations):
-        """P(o_t | s_t, models)"""
-        if not isinstance(observations, torch.Tensor):
-            observations = torch.tensor([observations])
-        
-        likelihoods = torch.zeros(self.vocab_size)
-        
-        for token_id in range(self.vocab_size):
-            likelihood = 0.0
-            
-            for m_idx, model in enumerate(self.models):
-                if token_id in observations:
-                    model_likelihood = 1.0
-                else:
-                    model_likelihood = 0.1
-                
-                likelihood += self.model_beliefs[m_idx] * model_likelihood
-            
-            likelihoods[token_id] = likelihood
-        
-        return likelihoods / torch.sum(likelihoods)
-    
-    def minimize_free_energy_beliefs(self, observations, max_iterations=5):
-        """Minimize free energy by updating beliefs"""
-        for iteration in range(max_iterations):
-            likelihood = self.compute_observation_likelihood(observations)
-            current_prior = self.get_current_prior()
-            
-            F_old, _, _ = self.compute_free_energy(
-                observations, self.token_beliefs, current_prior, likelihood
-            )
-            
-            # Update beliefs using variational free energy gradient
-            log_prior = torch.log(current_prior + 1e-8)
-            log_likelihood = torch.log(likelihood + 1e-8)
-            
-            gradient = (torch.log(self.token_beliefs + 1e-8) - log_prior - 
-                       self.precision_obs * log_likelihood)
-            
-            lr = 0.1
-            self.token_beliefs = torch.softmax(
-                torch.log(self.token_beliefs + 1e-8) - lr * gradient, dim=0
-            )
-            
-            # Check convergence
-            likelihood_new = self.compute_observation_likelihood(observations)
-            F_new, _, _ = self.compute_free_energy(
-                observations, self.token_beliefs, current_prior, likelihood_new
-            )
-            
-            if abs(F_new - F_old) < 1e-6:
-                break
-        
-        return self.token_beliefs
-    
-    def update_priors(self, context_tokens, observed_token):
-        """Update priors based on observed sequences"""
-        if len(context_tokens) > 0:
-            last_token = context_tokens[-1].item()
-            if last_token >= self.vocab_size:
-                last_token = last_token % self.vocab_size
-            if observed_token >= self.vocab_size:
-                observed_token = observed_token % self.vocab_size
-            
-            alpha = 0.01
-            self.transition_priors[last_token] = (
-                (1 - alpha) * self.transition_priors[last_token] + 
-                alpha * F.one_hot(torch.tensor(observed_token), self.vocab_size).float()
-            )
-            self.transition_priors[last_token] /= torch.sum(self.transition_priors[last_token])
 
 
 class TestActiveInference:
